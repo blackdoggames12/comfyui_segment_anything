@@ -1,8 +1,18 @@
 import os
 import sys
-sys.path.append(
-    os.path.dirname(os.path.abspath(__file__))
-)
+module_root = os.path.dirname(os.path.abspath(__file__))
+if module_root in sys.path:
+    sys.path.remove(module_root)
+sys.path.insert(0, module_root)
+
+# Avoid reusing a foreign local_groundingdino package from another custom node.
+# Some SAM2/SAM3 packs ship a module with the same name, which can break this node.
+for module_name, module in list(sys.modules.items()):
+    if module_name == "local_groundingdino" or module_name.startswith("local_groundingdino."):
+        module_file = getattr(module, "__file__", "") or ""
+        module_file = os.path.abspath(module_file) if module_file else ""
+        if not module_file.startswith(module_root):
+            sys.modules.pop(module_name, None)
 
 import copy
 import torch
@@ -334,6 +344,97 @@ class GroundingDinoSAMSegment:
             empty_mask = torch.zeros((1, height, width), dtype=torch.uint8, device="cpu")
             return (empty_mask, empty_mask)
         return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))
+
+
+class GroundingDino:
+    """
+    GroundingDino node that predicts bounding boxes from image and text prompt.
+    Emits BOXES type for SAMDetector compatibility.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ('IMAGE', {}),
+                "grounding_dino_model": ('GROUNDING_DINO_MODEL', {}),
+                "prompt": ("STRING", {"default": "person"}),
+                "threshold": ("FLOAT", {
+                    "default": 0.3,
+                    "min": 0,
+                    "max": 1.0,
+                    "step": 0.01
+                }),
+            }
+        }
+
+    CATEGORY = "segment_anything"
+    FUNCTION = "main"
+    RETURN_TYPES = ("BOXES",)
+
+    def main(self, image, grounding_dino_model, prompt, threshold):
+        res_boxes = []
+        for item in image:
+            item_pil = Image.fromarray(
+                np.clip(255. * item.cpu().numpy(), 0, 255).astype(np.uint8)
+            ).convert('RGB')
+            boxes = groundingdino_predict(
+                grounding_dino_model,
+                item_pil,
+                prompt,
+                threshold
+            )
+            if boxes.shape[0] > 0:
+                res_boxes.append(boxes)
+        
+        if len(res_boxes) == 0:
+            # Return empty BOXES tensor
+            empty_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            return (empty_boxes,)
+        
+        # Stack all boxes
+        return (torch.cat(res_boxes, dim=0),)
+
+
+class SAMDetector:
+    """
+    Compatibility node for legacy workflows expecting:
+      inputs: sam_model, image, boxes
+      output: MASK
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sam_model": ('SAM_MODEL', {}),
+                "image": ('IMAGE', {}),
+                "boxes": ('BOXES', {}),
+            }
+        }
+
+    CATEGORY = "segment_anything"
+    FUNCTION = "main"
+    RETURN_TYPES = ("MASK",)
+
+    def main(self, sam_model, image, boxes):
+        res_masks = []
+        for item in image:
+            item = Image.fromarray(
+                np.clip(255. * item.cpu().numpy(), 0, 255).astype(np.uint8)
+            ).convert('RGBA')
+
+            if boxes is None or boxes.shape[0] == 0:
+                continue
+
+            _, masks = sam_segment(sam_model, item, boxes)
+            if masks is not None:
+                res_masks.extend(masks)
+
+        if len(res_masks) == 0:
+            _, height, width, _ = image.size()
+            empty_mask = torch.zeros((1, height, width), dtype=torch.uint8, device="cpu")
+            return (empty_mask,)
+
+        return (torch.cat(res_masks, dim=0),)
 
 
 class InvertMask:
